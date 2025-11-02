@@ -1,5 +1,4 @@
 import math
-from functools import partial
 from dataclasses import dataclass
 
 import torch
@@ -9,9 +8,532 @@ import torch.nn.functional as F
 
 @dataclass
 class TransformerBlockConfig:
-    sequence_len: int = 1024
-    vocab_size: int = 50304
-    n_layer: int = 12
-    n_head: int = 6
-    n_kv_head: int = 6 
-    n_embd: int = 768
+    sequence_len: int = 128
+    vocab_size: int = 16
+    n_head: int = 4
+    n_kv_head: int = 4
+    n_embd: int = 256
+    n_layer: int = 6
+    # Adaptive computation parameters (ACT)
+    use_adaptive_computation: bool = True
+    n_layers_per_block: int = 2  # Number of layers per adaptive block
+    max_pondering_steps: int = 5
+    act_threshold: float = 0.99
+    halting_penalty: float = 0.01  # tau in ACT paper
+
+def norm(x):
+    # Purely functional rmsnorm with no learnable params
+    return F.rms_norm(x, (x.size(-1),))
+
+def apply_rotary_emb(x, cos, sin):
+    assert x.ndim == 4  # multihead attention
+    d = x.shape[3] // 2
+    x1, x2 = x[..., :d], x[..., d:] # split up last time into two halves
+    y1 = x1 * cos + x2 * sin # rotate pairs of dims
+    y2 = x1 * (-sin) + x2 * cos
+    out = torch.cat([y1, y2], 3) # re-assemble
+    out = out.to(x.dtype) # ensure input/output dtypes match
+    return out
+
+
+class HaltingUnit(nn.Module):
+    """Computes halting probability for adaptive computation."""
+    def __init__(self, n_embd):
+        super().__init__()
+        self.halting_linear = nn.Linear(n_embd, 1, bias=True)
+        nn.init.constant_(self.halting_linear.bias, 1.0)
+    
+    def forward(self, x):
+        """
+        Args:
+            x: (B, T, n_embd)
+        Returns:
+            halting_prob: (B, T, 1) - probability of halting at this step
+        """
+        return torch.sigmoid(self.halting_linear(x))
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head
+        self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_head
+        assert self.n_embd % self.n_head == 0
+        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
+        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+
+    def forward(self, x, cos_sin, kv_cache, shared_kv=None, input_pos=None):
+        """
+        Args:
+            x: input (B, T, C)
+            cos_sin: rotary_embd (full cache)
+            kv_cache: (for inference)
+            shared_kv: kv from first recursion step for adaptive computation
+            input_pos: (B, T) position indices for RoPE, useful for variable-length sequences
+        """
+        B, T, C = x.size()
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+
+        #  if shared_kv is given, adaptive computation, kv from first recursion)
+        if shared_kv is not None:
+            k, v = shared_kv 
+        else:
+            k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+            v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+
+        # Apply rotary embeddings with input_pos if provided
+        cos, sin = cos_sin
+        if input_pos is not None:
+            # Use input_pos to index into rotary embeddings for variable-length sequences
+            cos_selected = cos[:, input_pos, :, :].squeeze(0)   # (B, T, 1, D)
+            sin_selected = sin[:, input_pos, :, :].squeeze(0)
+            q = apply_rotary_emb(q, cos_selected, sin_selected)
+            if shared_kv is None:
+                k = apply_rotary_emb(k, cos_selected, sin_selected)
+        else:
+            # Use cos_sin as-is (already sliced to correct sequence positions)
+            q = apply_rotary_emb(q, cos, sin)
+            if shared_kv is None:  
+                k = apply_rotary_emb(k, cos, sin)
+        
+        q, k = norm(q), norm(k) 
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2) 
+
+        if kv_cache is not None and shared_kv is None:
+            k, v = kv_cache.insert_kv(self.layer_idx, k, v)
+        Tq = q.size(2) # number of queries in this forward pass
+        Tk = k.size(2) # number of keys/values in total (in the cache + current forward pass)
+
+        enable_gqa = self.n_head != self.n_kv_head
+        if kv_cache is None or Tq == Tk:
+            # During training (no KV cache), attend as usual with causal attention
+            # And even if there is KV cache, we can still use this simple version when Tq == Tk
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
+        elif Tq == 1:
+            # During inference but with a single query in this forward pass:
+            # The query has to attend to all the keys/values in the cache
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+        else:
+            # During inference AND we have a chunk of queries in this forward pass:
+            # First, each query attends to all the cached keys/values (i.e. full prefix)
+            attn_mask = torch.zeros((Tq, Tk), dtype=torch.bool, device=q.device) # True = keep, False = mask
+            prefix_len = Tk - Tq
+            if prefix_len > 0: # can't be negative but could be zero
+                attn_mask[:, :prefix_len] = True
+            # Then, causal attention within this chunk
+            attn_mask[:, prefix_len:] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
+
+        # Re-assemble the heads side by side and project back to residual stream
+        y = y.transpose(1, 2).contiguous().view(B, T, -1)
+        y = self.c_proj(y)
+        
+        # Return k, v for potential sharing in adaptive computation
+        return y, (k, v) if shared_kv is None else None
+
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = F.relu(x).square()
+        x = self.c_proj(x)
+        return x
+
+
+class Block(nn.Module):
+    """Single transformer layer (attention + MLP)."""
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.attn = CausalSelfAttention(config, layer_idx)
+        self.mlp = MLP(config)
+
+    def forward(self, x, cos_sin, kv_cache, shared_kv=None, input_pos=None):
+        """
+        Standard forward pass through one transformer layer.
+        
+        Args:
+            x: input (B, T, C)
+            cos_sin: rotary embeddings
+            kv_cache: KV cache for inference
+            shared_kv: Optional (k, v) from first recursion for adaptive computation
+            input_pos: Optional position indices for RoPE
+        
+        Returns:
+            x: output after attention + MLP
+            new_kv: K,V pair from attention (or None if using shared_kv)
+        """
+        attn_out, new_kv = self.attn(norm(x), cos_sin, kv_cache, shared_kv, input_pos)
+        x = x + attn_out
+        x = x + self.mlp(norm(x))
+        return x, new_kv
+
+
+class AdaptiveBlock(nn.Module):
+    """
+    Adaptive computation block containing N transformer layers.
+    Performs recursion over all N layers together, sharing K,V across recursion steps.
+    """
+    def __init__(self, config, start_layer_idx, n_layers_per_block):
+        super().__init__()
+        self.config = config
+        self.start_layer_idx = start_layer_idx
+        self.n_layers = n_layers_per_block
+        
+        # Create N transformer layers
+        self.layers = nn.ModuleList([
+            Block(config, start_layer_idx + i) 
+            for i in range(n_layers_per_block)
+        ])
+        
+        # Halting unit for adaptive computation
+        self.halting_unit = HaltingUnit(config.n_embd)
+    
+    def forward_once(self, x, cos_sin, shared_kvs=None, input_pos=None):
+        """
+        Single forward pass through all layers in this block.
+        
+        Args:
+            x: input (B, T, C)
+            cos_sin: rotary embeddings
+            shared_kvs: List of (k, v) pairs for each layer (or None for first recursion)
+            input_pos: Position indices for RoPE (B, T)
+        
+        Returns:
+            x: output after all layers
+            new_kvs: List of K,V pairs from each layer (or None if using shared_kvs)
+        """
+        # if it is first step -> shared_kvs will be None and new_kvs will be populated
+        new_kvs = []
+        for i, layer in enumerate(self.layers):
+            shared_kv = shared_kvs[i] if shared_kvs is not None else None
+            x, kv = layer(x, cos_sin, kv_cache=None, shared_kv=shared_kv, input_pos=input_pos)
+            new_kvs.append(kv)
+        
+        return x, (new_kvs if shared_kvs is None else None)
+    
+    def forward(self, x, cos_sin, input_pos=None):
+        B, T, C = x.size()
+        device = x.device
+        config = self.config
+
+        accumulated_output = torch.zeros_like(x)
+        accumulated_probs  = torch.zeros(B, T, 1, device=device)
+
+    
+        expected_steps     = torch.zeros(B, T, 1, device=device)  # Σ t * p_t (logging)
+        num_updates        = torch.zeros(B, T, 1, device=device)  # N(t) (integer counter)
+        remainder_at_halt  = torch.zeros(B, T, 1, device=device)  # R(t), differentiable
+        halted             = torch.zeros(B, T, dtype=torch.bool, device=device)
+
+        cached_kvs = None
+        x_current = x
+
+        for step in range(config.max_pondering_steps):
+            # count this update for tokens that are not yet halted
+            num_updates = num_updates + (~halted).unsqueeze(-1).float()
+
+            if step == 0:
+                x_step, kvs = self.forward_once(x_current, cos_sin, shared_kvs=None, input_pos=input_pos)
+                cached_kvs = kvs
+            else:
+                x_step, _   = self.forward_once(x_current, cos_sin, shared_kvs=cached_kvs, input_pos=input_pos)
+
+            halt_prob = self.halting_unit(x_step)  # (B,T,1)
+
+            is_last_step = (step == config.max_pondering_steps - 1)
+            should_halt  = (accumulated_probs + halt_prob >= config.act_threshold) | is_last_step
+
+            # mass assigned this step
+            remaining_mass = (1.0 - accumulated_probs)
+            step_weight = torch.where(should_halt, remaining_mass, halt_prob)  # p_t
+
+            # capture R(t) for tokens halted at this state
+            new_halts = should_halt & (~halted)
+            remainder_at_halt = torch.where(new_halts, remaining_mass, remainder_at_halt)
+
+            # accumulate output and probabilities
+            accumulated_output = accumulated_output + step_weight * x_step
+            accumulated_probs  = accumulated_probs  + step_weight   
+
+            # expected steps  (not used for loss  )
+            expected_steps = expected_steps + (step + 1) * step_weight
+
+            halted = halted | should_halt.squeeze(-1)
+            x_current = x_step
+
+            if halted.all():
+                break
+
+        # R(t): differentiable remainder
+        N_detached = num_updates.detach()
+        act_ponder = N_detached + remainder_at_halt  # shape (B,T,1)
+
+        return accumulated_output, act_ponder, expected_steps
+
+
+
+class GPT(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        # Build adaptive blocks or individual layers based on config
+        if config.use_adaptive_computation:
+            assert config.n_layer % config.n_layers_per_block == 0, \
+                f"n_layer ({config.n_layer}) must be divisible by n_layers_per_block ({config.n_layers_per_block})"
+            n_blocks = config.n_layer // config.n_layers_per_block
+            blocks = []
+            for block_idx in range(n_blocks):
+                start_layer_idx = block_idx * config.n_layers_per_block
+                blocks.append(AdaptiveBlock(config, start_layer_idx, config.n_layers_per_block))
+            self.transformer = nn.ModuleDict({
+                "wte": nn.Embedding(config.vocab_size, config.n_embd),
+                "h": nn.ModuleList(blocks),
+            })
+            self.use_adaptive_blocks = True
+        else:
+            # standard transformer
+            self.transformer = nn.ModuleDict({
+                "wte": nn.Embedding(config.vocab_size, config.n_embd),
+                "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
+            })
+            self.use_adaptive_blocks = False
+        
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # To support meta device initialization, we init the rotary embeddings here, but it's fake
+        # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
+        # so let's just over-compute them, but assert fail if we ever reach that amount.
+        # In the future we can dynamically grow the cache, for now it's fine.
+        self.rotary_seq_len = config.sequence_len * 4
+        head_dim = config.n_embd // config.n_head
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
+        self.register_buffer("sin", sin, persistent=False)
+
+    def init_weights(self):
+        self.apply(self._init_weights)
+        # zero out classifier weights
+        torch.nn.init.zeros_(self.lm_head.weight)
+        # zero out c_proj weights in all blocks
+        for block in self.transformer.h:
+            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            torch.nn.init.zeros_(block.attn.c_proj.weight)
+        # init the rotary embeddings
+        head_dim = self.config.n_embd // self.config.n_head
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        self.cos, self.sin = cos, sin
+        # Cast the embeddings from fp32 to bf16: optim can tolerate it and it saves memory: both in the model and the activations
+        if self.transformer.wte.weight.device.type == "cuda":
+            self.transformer.wte.to(dtype=torch.bfloat16)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            # https://arxiv.org/pdf/2310.17813
+            fan_out = module.weight.size(0)
+            fan_in = module.weight.size(1)
+            std = 1.0 / math.sqrt(fan_in) * min(1.0, math.sqrt(fan_out / fan_in))
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=1.0)
+
+    # TODO: bump base theta more, e.g. 100K is more common more recently
+    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
+        # autodetect the device from model embeddings
+        if device is None:
+            device = self.transformer.wte.weight.device
+        # stride the channels
+        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
+        inv_freq = 1.0 / (base ** (channel_range / head_dim))
+        # stride the time steps
+        t = torch.arange(seq_len, dtype=torch.float32, device=device)
+        # calculate the rotation frequencies at each (time, channel) pair
+        freqs = torch.outer(t, inv_freq)
+        cos, sin = freqs.cos(), freqs.sin()
+        cos, sin = cos.bfloat16(), sin.bfloat16() # keep them in bfloat16
+        cos, sin = cos[None, :, None, :], sin[None, :, None, :] # add batch and head dims for later broadcasting
+        return cos, sin
+
+    def get_device(self):
+        return self.transformer.wte.weight.device
+
+    def estimate_flops(self):
+        """ Return the estimated FLOPs per token for the model. Ref: https://arxiv.org/abs/2204.02311 """
+        nparams = sum(p.numel() for p in self.parameters())
+        nparams_embedding = self.transformer.wte.weight.numel()
+        n_layers, n_heads, head_dim, seq_len = (
+            self.config.n_layer, 
+            self.config.n_head, 
+            self.config.n_embd // self.config.n_head, 
+            self.config.sequence_len
+        )
+        num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * n_layers * n_heads * head_dim * seq_len
+        return num_flops_per_token
+
+    def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):
+        """
+        Setup optimizers for training. 
+        Note: Requires external optimizers (Muon, DistAdamW, DistMuon) to be imported if using DDP.
+        For simple training, just use standard PyTorch optimizers.
+        """
+        model_dim = self.config.n_embd
+        
+        # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
+        matrix_params = list(self.transformer.h.parameters())
+        embedding_params = list(self.transformer.wte.parameters())
+        lm_head_params = list(self.lm_head.parameters())
+        
+        # Create a simple AdamW optimizer for all parameters
+        # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
+        dmodel_lr_scale = (model_dim / 768) ** -0.5
+        print(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
+        
+        param_groups = [
+            dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
+            dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
+            dict(params=matrix_params, lr=matrix_lr * dmodel_lr_scale),
+        ]
+        
+        optimizer = torch.optim.AdamW(
+            param_groups,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=weight_decay
+        )
+        
+        for group in optimizer.param_groups:
+            group["initial_lr"] = group["lr"]
+        
+        return optimizer
+
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+        B, T = idx.size()
+
+        # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim))
+        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
+        assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
+        assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"
+        # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
+        T0 = 0 if kv_cache is None else kv_cache.get_pos()
+        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
+
+        if self.config.use_adaptive_computation and targets is not None:
+            return self.forward_adaptive(idx, targets, cos_sin, loss_reduction)
+
+        # Standard forward pass (no adaptive computation)
+        # Forward the trunk of the Transformer
+        x = self.transformer.wte(idx)
+        x = norm(x)
+        
+        if self.use_adaptive_blocks:
+            # Using AdaptiveBlocks but in non-adaptive mode (shouldn't happen, but handle it)
+            for block in self.transformer.h:
+                # Just use forward_once without adaptive computation
+                x, _ = block.forward_once(x, cos_sin, shared_kvs=None, input_pos=None)
+        else:
+            # Standard individual layers
+            for layer in self.transformer.h:
+                x, _ = layer(x, cos_sin, kv_cache, shared_kv=None, input_pos=None)
+            
+        x = norm(x)
+
+        # Forward the lm_head (compute logits)
+        softcap = 15
+        if targets is not None:
+            # training mode: compute and return the loss
+            # TODO: experiment with Liger Kernels / chunked cross-entropy etc.
+            logits = self.lm_head(x)
+            logits = softcap * torch.tanh(logits / softcap) # logits softcap
+            logits = logits.float() # use tf32/fp32 for logits
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            return loss
+        else:
+            # inference mode: compute and return the logits
+            logits = self.lm_head(x)
+            logits = softcap * torch.tanh(logits / softcap) # logits softcap
+            return logits
+    
+    def forward_adaptive(self, idx, targets, cos_sin, loss_reduction='mean'):
+        B, T = idx.size()
+        config = self.config
+
+        x = self.transformer.wte(idx)
+        x = norm(x)
+        input_pos = torch.arange(T, device=idx.device).unsqueeze(0).expand(B, -1)
+
+        total_act_ponder = torch.zeros(B, T, 1, device=idx.device)
+        total_expected   = torch.zeros(B, T, 1, device=idx.device) 
+
+        for block in self.transformer.h:
+            x, act_ponder, expected_steps = block(x, cos_sin, input_pos=input_pos)
+            total_act_ponder = total_act_ponder + act_ponder
+            total_expected   = total_expected   + expected_steps  
+
+        x = norm(x)
+
+        softcap = 15
+        logits = self.lm_head(x)
+        logits = softcap * torch.tanh(logits / softcap)
+        logits = logits.float()
+
+        task_loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
+            ignore_index=-1,
+            reduction=loss_reduction
+        )
+
+        # ACT penalty: τ * mean_{batch,tokens,blocks} [ N(t) + R(t) ]
+        act_penalty = config.halting_penalty * total_act_ponder.mean()
+
+        total_loss = task_loss + act_penalty
+
+        self.last_ponder_cost = total_act_ponder.mean().item()
+        self.last_expected_steps = total_expected.mean().item()
+        self.last_act_penalty = act_penalty.item()
+
+        return total_loss
+
+
+    @torch.inference_mode()
+    def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
+        """
+        Naive autoregressive streaming inference.
+        To make it super simple, let's assume:
+        - batch size is 1
+        - ids and the yielded tokens are simple Python lists and ints
+        """
+        assert isinstance(tokens, list)
+        device = self.get_device()
+        rng = None
+        if temperature > 0:
+            rng = torch.Generator(device=device)
+            rng.manual_seed(seed)
+        ids = torch.tensor([tokens], dtype=torch.long, device=device) # add batch dim
+        for _ in range(max_tokens):
+            logits = self.forward(ids) # (B, T, vocab_size)
+            logits = logits[:, -1, :] # (B, vocab_size)
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            if temperature > 0:
+                logits = logits / temperature
+                probs = F.softmax(logits, dim=-1)
+                next_ids = torch.multinomial(probs, num_samples=1, generator=rng)
+            else:
+                next_ids = torch.argmax(logits, dim=-1, keepdim=True)
+            ids = torch.cat((ids, next_ids), dim=1)
+            token = next_ids.item()
+            yield token
