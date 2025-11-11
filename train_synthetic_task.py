@@ -1,7 +1,6 @@
 import torch
 from torch.utils.data import DataLoader
 
-from tokenizer import TinyTokenizer
 from dataset.synthetic_tasks import AddMul, Difficulty, make_collate_fn, Tokenizer
 from models.transformer import GPT, TransformerBlockConfig
 
@@ -72,6 +71,7 @@ def main():
     with torch.inference_mode():
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             input_seq, output_seq = ds[0]
+            batch = collate_fn([ (input_seq, output_seq) ]) 
             print("Problem:", "".join(input_seq), "Answer:", "".join(output_seq))
             prompt_ids = tokenizer.encode(input_seq)  # includes '='
             outs = []

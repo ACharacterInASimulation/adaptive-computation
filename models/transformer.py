@@ -116,8 +116,9 @@ class HaltingUnit(nn.Module):
     def __init__(self, n_embd):
         super().__init__()
         self.halting_linear = nn.Linear(n_embd, 1, bias=True)
-        nn.init.constant_(self.halting_linear.bias, 1.0)
-    
+        nn.init.constant_(self.halting_linear.bias, 0.0)
+        self.halting_linear.is_halting_unit = True
+
     def forward(self, x):
         """
         Args:
@@ -405,8 +406,8 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
         # Cast the embeddings from fp32 to bf16: optim can tolerate it and it saves memory: both in the model and the activations
-        if self.transformer.wte.weight.device.type == "cuda":
-            self.transformer.wte.to(dtype=torch.bfloat16)
+        #if self.transformer.wte.weight.device.type == "cuda":
+            #self.transformer.wte.to(dtype=torch.bfloat16)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -415,7 +416,7 @@ class GPT(nn.Module):
             fan_in = module.weight.size(1)
             std = 1.0 / math.sqrt(fan_in) * min(1.0, math.sqrt(fan_out / fan_in))
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
-            if module.bias is not None:
+            if module.bias is not None and not hasattr(module, 'is_halting_unit'):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=1.0)
@@ -433,7 +434,7 @@ class GPT(nn.Module):
         # calculate the rotation frequencies at each (time, channel) pair
         freqs = torch.outer(t, inv_freq)
         cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.bfloat16(), sin.bfloat16() # keep them in bfloat16
+        #cos, sin = cos.bfloat16(), sin.bfloat16() # keep them in bfloat16
         cos, sin = cos[None, :, None, :], sin[None, :, None, :] # add batch and head dims for later broadcasting
         return cos, sin
 
@@ -441,7 +442,7 @@ class GPT(nn.Module):
         return self.transformer.wte.weight.device
 
 
-    def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):
+    def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.02, matrix_lr=0.02, halting_lr=0.05, weight_decay=0.0):
         """
         Setup optimizers for training. 
         Note: Requires external optimizers (Muon, DistAdamW, DistMuon) to be imported if using DDP.
@@ -450,9 +451,20 @@ class GPT(nn.Module):
         model_dim = self.config.n_embd
         
         # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
-        matrix_params = list(self.transformer.h.parameters())
+        matrix_params = []
+        halting_params = []
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
+
+        for block in self.transformer.h:
+            if isinstance(block, AdaptiveBlock):
+                # Add halting unit params separately
+                halting_params.extend(block.halting_unit.parameters())
+                # Add layer params (excluding halting)
+                for layer in block.layers:
+                    matrix_params.extend(layer.parameters())
+            else:
+                matrix_params.extend(block.parameters())
         
         # Create a simple AdamW optimizer for all parameters
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
@@ -463,6 +475,7 @@ class GPT(nn.Module):
             dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
             dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
             dict(params=matrix_params, lr=matrix_lr * dmodel_lr_scale),
+            dict(params=halting_params, lr=halting_lr * dmodel_lr_scale),
         ]
         
         optimizer = torch.optim.AdamW(
@@ -486,7 +499,7 @@ class GPT(nn.Module):
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
         assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
-        assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"
+        #assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
@@ -505,19 +518,19 @@ class GPT(nn.Module):
         x = norm(x)
 
         # Forward the lm_head (compute logits)
-        softcap = 15
+        #softcap = 15
         if targets is not None:
             # training mode: compute and return the loss
             # TODO: experiment with Liger Kernels / chunked cross-entropy etc.
             logits = self.lm_head(x)
-            logits = softcap * torch.tanh(logits / softcap) # logits softcap
+            #logits = softcap * torch.tanh(logits / softcap) # logits softcap
             logits = logits.float() # use tf32/fp32 for logits
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
             return loss
         else:
             # inference mode: compute and return the logits
             logits = self.lm_head(x)
-            logits = softcap * torch.tanh(logits / softcap) # logits softcap
+            #logits = softcap * torch.tanh(logits / softcap) # logits softcap
             return logits
 
     def forward_adaptive(self, idx, targets,  cos_sin, kv_cache, loss_reduction='mean', ponder_mask=None):
@@ -537,9 +550,9 @@ class GPT(nn.Module):
 
         x = norm(x)
 
-        softcap = 15
+        #softcap = 15
         logits = self.lm_head(x)
-        logits = softcap * torch.tanh(logits / softcap)
+        #logits = softcap * torch.tanh(logits / softcap)
         logits = logits.float()
 
         if targets is None:
@@ -569,12 +582,14 @@ class GPT(nn.Module):
 
 
     @torch.inference_mode()
-    def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
+    def generate(self, tokens, max_tokens, ponder_mask=None, temperature=1.0, top_k=None, seed=42):
         assert isinstance(tokens, list)
         device = self.get_device()
         if temperature > 0:
             rng = torch.Generator(device=device).manual_seed(seed)
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
+        if ponder_mask:
+            ponder_mask = torch.tensor([ponder_mask], dtype=torch.float32, device=device)
 
         head_dim = self.config.n_embd // self.config.n_head
         kv_cache = KVCache(
@@ -585,7 +600,7 @@ class GPT(nn.Module):
             num_layers=self.config.n_layer,
         )
 
-        _ = self.forward(ids, kv_cache=kv_cache)  
+        _ = self.forward(ids, kv_cache=kv_cache, ponder_mask=ponder_mask)
 
         for _ in range(max_tokens):
             last = ids[:, -1:]       
