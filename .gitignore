@@ -194,6 +194,8 @@ cython_debug/
 .cursorindexingignore
 
 checkpoints/
+wandb/
+logs/
 results/
 hf_cache/
 hf_datasets/

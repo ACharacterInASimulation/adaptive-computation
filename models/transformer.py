@@ -347,7 +347,7 @@ class AdaptiveBlock(nn.Module):
 
         # R(t): differentiable remainder
         N_detached = num_updates.detach()
-        act_ponder = remainder_at_halt  # shape (B,T,1)
+        act_ponder = remainder_at_halt + N_detached  # shape (B,T,1)
 
         return accumulated_output, act_ponder, N_detached
 
@@ -526,12 +526,12 @@ class GPT(nn.Module):
             #logits = softcap * torch.tanh(logits / softcap) # logits softcap
             logits = logits.float() # use tf32/fp32 for logits
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
+            return loss, None
         else:
             # inference mode: compute and return the logits
             logits = self.lm_head(x)
             #logits = softcap * torch.tanh(logits / softcap) # logits softcap
-            return logits
+            return logits, None
 
     def forward_adaptive(self, idx, targets,  cos_sin, kv_cache, loss_reduction='mean', ponder_mask=None):
         B, T = idx.size()
@@ -555,30 +555,27 @@ class GPT(nn.Module):
         #logits = softcap * torch.tanh(logits / softcap)
         logits = logits.float()
 
+        if ponder_mask is None:
+            act_penalty =  self.config.halting_penalty * total_act_ponder.mean()
+            self.last_expected_steps = total_expected.mean().item() / self.config.n_layer
+        else:
+            pm = ponder_mask.float()
+            denom = pm.sum().clamp_min(1.0) 
+            act_penalty = (self.config.halting_penalty * (total_act_ponder * pm).sum()) / denom
+            self.last_expected_steps = (total_expected * pm).sum().item() / (denom * self.config.n_layer)
+
         if targets is None:
             return logits
-
         task_loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1),
             ignore_index=-1,
             reduction=loss_reduction
         )
+       
 
-        if ponder_mask is None:
-            act_penalty = self.config.halting_penalty * total_act_ponder.mean()
-            self.last_ponder_cost = total_act_ponder.mean().item()
-            self.last_expected_steps = total_expected.mean().item()
-        else:
-            pm = ponder_mask.float()
-            denom = pm.sum().clamp_min(1.0)
-            act_penalty = self.config.halting_penalty * (total_act_ponder * pm).sum() / denom
-            self.last_ponder_cost = (total_act_ponder * pm).sum() / denom
-            self.last_expected_steps = (total_expected * pm).sum() / denom
-
-        total_loss = task_loss + act_penalty
         self.last_act_penalty = act_penalty.item()
-        return total_loss
+        return task_loss, act_penalty
 
 
     @torch.inference_mode()
@@ -600,19 +597,22 @@ class GPT(nn.Module):
             num_layers=self.config.n_layer,
         )
 
-        _ = self.forward(ids, kv_cache=kv_cache, ponder_mask=ponder_mask)
-
+        # Prefill
+        logits = self.forward(ids, kv_cache=kv_cache, ponder_mask=ponder_mask)
+        
         for _ in range(max_tokens):
-            last = ids[:, -1:]       
-            logits = self.forward(last, kv_cache=kv_cache)  
-            logits = logits[:, -1, :]
+            logits_last = logits[:, -1, :]
+
             if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('inf')
+                v, _ = torch.topk(logits_last, min(top_k, logits_last.size(-1)))
+                logits_last[logits_last < v[:, [-1]]] = -float('inf')
+            
             if temperature > 0:
-                probs = F.softmax(logits / temperature, dim=-1)
+                probs = F.softmax(logits_last / temperature, dim=-1)
                 next_id = torch.multinomial(probs, num_samples=1, generator=rng)
             else:
-                next_id = torch.argmax(logits, dim=-1, keepdim=True)
-            ids = torch.cat((ids, next_id), dim=1)
-            yield next_id.item()
+                next_id = torch.argmax(logits_last, dim=-1, keepdim=True)
+            
+            yield next_id.item(), self.last_expected_steps
+            
+            logits = self.forward(next_id, kv_cache=kv_cache)

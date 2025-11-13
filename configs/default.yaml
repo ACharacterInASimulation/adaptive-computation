@@ -1,0 +1,56 @@
+
+model:
+  sequence_len: 128
+  n_head: 4
+  n_kv_head: 4
+  n_embd: 128
+  n_layer: 4
+  
+  use_adaptive_computation: true
+  n_layers_per_block: 1
+  max_pondering_steps: 5
+  act_threshold: 0.99
+  halting_penalty: 0.001
+
+
+data:
+  num_samples: 100_000_000
+  max_operands: 5
+  max_digits: 5
+  operations: ["+", "*"]
+  seed: 0
+
+
+optimizer:
+  unembedding_lr: 0.004
+  embedding_lr: 0.004
+  matrix_lr: 0.004
+  halting_lr: 0.08
+  weight_decay: 0.0
+
+
+training:
+  batch_size: 256
+  num_workers: 0
+  steps: 200000
+  log_every: 100
+  eval_every: 10000
+  eval_n_samples: 500
+  warmup_steps: 2000
+  gradient_clip: 1.0
+  seed: 42
+
+
+wandb:
+  enabled: true
+  project: "dl-project"
+  entity: null  
+  name: null  
+  tags: ["act", "arithmetic"]
+  notes: "ACT training on arithmetic tasks"
+
+
+checkpoint:
+  save_dir: "checkpoints"
+  save_final: true
+  final_name: "final_model.pt"

@@ -12,14 +12,14 @@ class Difficulty:
     operations: List[Literal["+", "*"]]
 
 class AddMul(Dataset):
-    def __init__(self, num_samples=50_000, max_operands=6, max_digits=6, seed=0):
+    def __init__(self, num_samples=50_000, max_operands=6, max_digits=6, seed=0, operations=["+", "*"]):
         super().__init__()
         self.num_samples = num_samples
         self.max_operands = max_operands
         self.max_digits = max_digits
         self.rng = random.Random(seed)
         self.current_difficulty = Difficulty(
-            max_operands=max_operands, max_digits=max_digits, operations=["+", "*"]
+            max_operands=max_operands, max_digits=max_digits, operations=operations
         )
 
     def set_difficulty(self, difficulty: Difficulty):
@@ -137,4 +137,94 @@ class Tokenizer:
 
     def decode(self, ids):  
         return [self.itos[i] for i in ids]
+
+
+def _safe_int(s):
+    try:
+        if s == "" or s == "-":
+            return None
+        return int(s)
+    except Exception:
+        return None
+
+def generate_eval(model, ds, tokenizer, n_samples=1000, max_tokens=40, temperature=0.0):
+    """
+    Evaluate model on arithmetic tasks.
+    
+    Returns:
+        dict with metrics: exact_match_acc, digit_acc, avg_steps, normalized_error
+    """
+    model.eval()
+    total_steps = 0
+    n_tokens = 0
+    exact_match = 0
+    total_digits_correct = 0
+    total_digits = 0
+    normalized_error = 0.0
+    n_valid = 0  
+
+    for idx in range(min(n_samples, len(ds))):
+        input_seq, output_seq = ds[idx]
+        prompt_ids = tokenizer.encode(input_seq)  
+        ponder_mask = [0] * len(prompt_ids)
+        ponder_mask[-1] = 1  # Only ponder on the '=' token
+        
+        outs = []
+        for tok, n_steps in model.generate(tokens=prompt_ids, ponder_mask=ponder_mask, 
+                                          max_tokens=max_tokens, temperature=temperature):
+            if tok == tokenizer.eos_id:
+                break
+            total_steps += n_steps
+            n_tokens += 1
+            outs.append(tok)
+        
+        output_str = "".join(tokenizer.decode(outs)).strip()
+        gold_str = "".join(output_seq).strip()
+        
+        # Convert to integers for numerical comparison
+        output_int = _safe_int(output_str)
+        gold_int = _safe_int(gold_str)
+
+        # Exact match check
+        if output_int is not None and gold_int is not None:
+            n_valid += 1
+            if output_int == gold_int:
+                exact_match += 1
+            
+            
+            output_digits = str(output_int)
+            gold_digits = str(gold_int)
+            total_digits += len(gold_digits)
+            
+            
+            for i in range(min(len(output_digits), len(gold_digits))):
+                if output_digits[i] == gold_digits[i]:
+                    total_digits_correct += 1
+            
+            # |predicted - gold| / |gold|
+            if gold_int != 0:
+                normalized_error += abs(gold_int - output_int) / abs(gold_int)
+            elif output_int != 0:
+                normalized_error += 1.0 
+        else:
+            n_valid += 1
+            normalized_error += 1.0
+            if gold_int is not None:
+                total_digits += len(str(gold_int))
+
+    # Compute metrics
+    exact_match_acc = exact_match / n_valid if n_valid > 0 else 0.0
+    digit_acc = total_digits_correct / total_digits if total_digits > 0 else 0.0
+    avg_steps = total_steps / n_tokens if n_tokens > 0 else 0.0
+    avg_normalized_error = normalized_error / n_valid if n_valid > 0 else 1.0
+
+    return {
+        "exact_match_acc": exact_match_acc,
+        "digit_acc": digit_acc,
+        "avg_steps": avg_steps,
+        "normalized_error": avg_normalized_error,
+        "n_samples": n_valid,
+        "n_tokens": n_tokens,
+    }
+
 
