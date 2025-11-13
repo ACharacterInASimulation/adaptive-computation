@@ -1,3 +1,5 @@
+"GPT modelling copied from https://github.com/karpathy/nanochat/tree/master"
+
 import math
 from dataclasses import dataclass
 
