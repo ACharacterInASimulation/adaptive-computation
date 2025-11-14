@@ -3,6 +3,7 @@
 #SBATCH --output=../logs/%x_%j.out
 #SBATCH --error=../logs/%x_%j.err
 #SBATCH --nodes=1
+#SBATCH --nodelist=ws-l4-021
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:nvidia-rtx-5000-ada-generation:1
@@ -22,4 +23,16 @@ source .env
 set +a
 
 # Run training script
-python train_synthetic_task.py --config configs/default.yaml
+#python train_synthetic_task.py --config configs/default.yaml
+
+python train.py --config configs/shared_kv_naive.yaml
+
+python train.py --config configs/naive.yaml
+
+python train.py --config configs/babylm_act.yaml
+
+python train.py --config configs/babylm_naive.yaml
+
+python train.py --config configs/babylm_shared_kv_naive.yaml
+
+python train.py --config configs/act.yaml

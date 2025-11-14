@@ -1,0 +1,55 @@
+model:
+  sequence_len: 512
+  n_head: 8
+  n_kv_head: 8
+  n_embd: 512
+  n_layer: 30
+  share_kv: true
+  share_kv_n_layers: 5
+  use_adaptive_computation: false
+  n_layers_per_block: 1
+  max_pondering_steps: 5
+  act_threshold: 0.99
+  halting_penalty: 0.0001
+
+
+data:
+  dataset_name: "BabyLM"  
+  data_dir: "./data/babylm/train_100M/"
+  val_data_dir: "./data/babylm/dev/"
+  tokenizer_path: "checkpoints"
+  shuffle: true
+
+
+optimizer:
+  unembedding_lr: 0.001
+  embedding_lr: 0.001
+  matrix_lr: 0.001
+  halting_lr: 0.04
+
+
+training:
+  batch_size: 16
+  num_workers: 4
+  steps: 50000
+  log_every: 20
+  eval_every: 100
+  eval_n_samples: 64
+  warmup_steps: 50
+  gradient_clip: 1.0
+  seed: 42
+
+
+wandb:
+  enabled: true
+  project: "DL-project"
+  entity: null  
+  name: null  
+  tags: ["act", "synthetic_task", "language-modeling"]
+  notes: "DL-project exp ACT"
+
+
+checkpoint:
+  save_dir: "checkpoints/babylm"
+  save_final: true
+  final_name: "babylm_shared_kv.pt"

@@ -219,10 +219,10 @@ def generate_eval(model, ds, tokenizer, n_samples=1000, max_tokens=40, temperatu
     avg_normalized_error = normalized_error / n_valid if n_valid > 0 else 1.0
 
     return {
-        "exact_match_acc": exact_match_acc,
-        "digit_acc": digit_acc,
+        "exact_match_acc": exact_match_acc * 100,
+        "digit_acc": digit_acc * 100,
         "avg_steps": avg_steps,
-        "normalized_error": avg_normalized_error,
+        "normalized_error": avg_normalized_error * 100,
         "n_samples": n_valid,
         "n_tokens": n_tokens,
     }

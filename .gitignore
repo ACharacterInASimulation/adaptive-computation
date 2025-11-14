@@ -194,6 +194,7 @@ cython_debug/
 .cursorindexingignore
 
 checkpoints/
+data/
 wandb/
 logs/
 results/
