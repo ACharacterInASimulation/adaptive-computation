@@ -2,17 +2,25 @@ model:
   sequence_len: 512
   n_head: 8
   n_kv_head: 8
-  n_embd: 512
-  n_layer: 30
+  n_embd: 256
+  n_layer: 6
+  
+  # Recursive configuration
+  recursive: true
+  recursion_depth: 5
+  
+  # Disable other features
+  share_kv: false
+  share_kv_n_layers: 0
   use_adaptive_computation: false
   n_layers_per_block: 1
   max_pondering_steps: 5
   act_threshold: 0.99
-  halting_penalty: 0.0001
+  halting_penalty: 0.001
 
 
 data:
-  dataset_name: "BabyLM"  
+  dataset_name: "BabyLM"
   data_dir: "./data/babylm/train_100M/"
   val_data_dir: "./data/babylm/dev/"
   tokenizer_path: "checkpoints"
@@ -20,21 +28,21 @@ data:
 
 
 optimizer:
-  unembedding_lr: 0.001
-  embedding_lr: 0.001
-  matrix_lr: 0.001
-  halting_lr: 0.04
-  weight_decay: 0.0
+  unembedding_lr: 0.003
+  embedding_lr: 0.003
+  matrix_lr: 0.003
+  halting_lr: 0.06
+  weight_decay: 0.01
 
 
 training:
-  batch_size: 16
+  batch_size: 32
   num_workers: 4
   steps: 50000
-  log_every: 10
-  eval_every: 10
-  eval_n_samples: 16
-  warmup_steps: 100
+  log_every: 100
+  eval_every: 5000
+  eval_n_samples: 500
+  warmup_steps: 2000
   gradient_clip: 1.0
   seed: 42
 
@@ -49,6 +57,6 @@ wandb:
 
 
 checkpoint:
-  save_dir: "checkpoints/babylm"
+  save_dir: "checkpoints/babylm_recursive"
   save_final: true
-  final_name: "babylm_naive.pt"
+  final_name: "babylm_recursive_model.pt"

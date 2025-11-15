@@ -27,8 +27,8 @@ class AdaptiveBlock(nn.Module):
     
     def forward_once(self, x, cos_sin, kv_cache, shared_kvs=None):
         """
-        Single forward pass through all layers in this block.
-        
+        single forward pass through all layers in this block.
+
         Args:
             x: input (B, T, C)
             cos_sin: rotary embeddings
@@ -62,8 +62,8 @@ class AdaptiveBlock(nn.Module):
 
         accumulated_output = torch.zeros_like(x)
         accumulated_probs  = torch.zeros(B, T, 1, device=device)
-        num_updates        = torch.zeros(B, T, 1, device=device)  # N(t) (integer counter)
-        remainder_at_halt  = torch.zeros(B, T, 1, device=device)  # R(t), differentiable
+        num_updates        = torch.zeros(B, T, 1, device=device)  
+        remainder_at_halt  = torch.zeros(B, T, 1, device=device)  
         halted             = torch.zeros(B, T, dtype=torch.bool, device=device)
 
         cached_kvs = None

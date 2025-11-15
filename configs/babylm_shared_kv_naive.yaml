@@ -26,6 +26,7 @@ optimizer:
   embedding_lr: 0.001
   matrix_lr: 0.001
   halting_lr: 0.04
+  weight_decay: 0.0
 
 
 training:
@@ -42,11 +43,11 @@ training:
 
 wandb:
   enabled: true
-  project: "DL-project"
+  project: "DL-babylm"
   entity: null  
   name: null  
-  tags: ["act", "synthetic_task", "language-modeling"]
-  notes: "DL-project exp ACT"
+  tags: ["recursive", "babylm", "language-modeling", "act"]
+  notes: "DL -project (babylm dataset)"
 
 
 checkpoint:

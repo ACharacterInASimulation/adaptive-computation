@@ -58,14 +58,22 @@ def init_wandb(model_cfg, config):
         else:
             kv_suffix = ""
         
+        # Check if using recursive model
+        recursive = getattr(model_cfg, 'recursive', False)
+        if recursive:
+            recursion_depth = getattr(model_cfg, 'recursion_depth', 5)
+            recursive_suffix = f"-Rec{recursion_depth}"
+        else:
+            recursive_suffix = ""
+        
         if model_cfg.use_adaptive_computation:
             max_steps = model_cfg.max_pondering_steps
             n_blocks = model_cfg.n_layers_per_block
             threshold = model_cfg.act_threshold
             penalty = model_cfg.halting_penalty
-            name = f"{dataset}-d{n_embd}-l{n_layer}-h{n_head}-{kv_type}{kv_suffix}-ACT{max_steps}x{n_blocks}-th{threshold}-pen{penalty}"
+            name = f"{dataset}-d{n_embd}-l{n_layer}-h{n_head}-{kv_type}{kv_suffix}{recursive_suffix}-ACT{max_steps}x{n_blocks}-th{threshold}-pen{penalty}"
         else:
-            name = f"{dataset}-d{n_embd}-l{n_layer}-h{n_head}-{kv_type}{kv_suffix}-baseline"
+            name = f"{dataset}-d{n_embd}-l{n_layer}-h{n_head}-{kv_type}{kv_suffix}{recursive_suffix}-baseline"
 
     run = wandb.init(
         project=wandb_cfg["project"],
@@ -182,6 +190,8 @@ def main(config_file="configs/babylm_act.yaml"):
         n_layer=MODEL_CFG["n_layer"],
         share_kv=MODEL_CFG.get("share_kv", False),
         share_kv_n_layers=MODEL_CFG.get("share_kv_n_layers", 0),
+        recursive=MODEL_CFG.get("recursive", False),
+        recursion_depth=MODEL_CFG.get("recursion_depth", 5),
         use_adaptive_computation=MODEL_CFG["use_adaptive_computation"],
         n_layers_per_block=MODEL_CFG["n_layers_per_block"],
         max_pondering_steps=MODEL_CFG["max_pondering_steps"],

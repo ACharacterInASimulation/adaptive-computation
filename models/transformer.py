@@ -24,6 +24,10 @@ class TransformerBlockConfig:
     share_kv: bool = False
     share_kv_n_layers: int = 2
 
+    #recursive
+    recursive: bool = False
+    recursion_depth: int = 5
+
     # Adaptive computation parameters (ACT)
     use_adaptive_computation: bool = True
     n_layers_per_block: int = 1  # Number of layers per adaptive block
@@ -281,6 +285,9 @@ class GPT(nn.Module):
                 assert config.n_layer % config.share_kv_n_layers == 0, \
                 f"n_layer ({config.n_layer}) must be divisible by share_kv_n_layers ({config.share_kv_n_layers})"
 
+            if config.recursive:
+                assert config.recursion_depth > 0, "Recursion depth must be positive"
+
             self.transformer = nn.ModuleDict({
                 "wte": nn.Embedding(config.vocab_size, config.n_embd),
                 "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
@@ -372,7 +379,8 @@ class GPT(nn.Module):
                 # Add layer params (excluding halting)
                 for layer in block.layers:
                     matrix_params.extend(layer.parameters())
-            else:
+
+
                 matrix_params.extend(block.parameters())
         
         # Create a simple AdamW optimizer for all parameters
@@ -423,8 +431,15 @@ class GPT(nn.Module):
         
         shared_kv = None
         for i, layer in enumerate(self.transformer.h):
-            if self.config.share_kv and i % self.config.share_kv_n_layers == 0:
+            
+            if self.config.recursive:
+                for j in range(self.config.recursion_depth):
+                    x, shared_kv = layer(x, cos_sin, kv_cache, shared_kv=shared_kv)
+                shared_kv = None
+
+            elif self.config.share_kv and i % self.config.share_kv_n_layers == 0:
                 x, shared_kv = layer(x, cos_sin, kv_cache, shared_kv=shared_kv)
+
             else:
                 x, _ = layer(x, cos_sin, kv_cache, shared_kv=shared_kv)
 
@@ -432,6 +447,7 @@ class GPT(nn.Module):
 
         # Forward the lm_head (compute logits)
         #softcap = 15
+
         if targets is not None:
             # training mode: compute and return the loss
             # TODO: experiment with Liger Kernels / chunked cross-entropy etc.
