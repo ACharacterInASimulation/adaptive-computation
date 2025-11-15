@@ -431,22 +431,22 @@ class GPT(nn.Module):
         
         shared_kv = None
         for i, layer in enumerate(self.transformer.h):
-            
+
             if self.config.recursive:
                 for j in range(self.config.recursion_depth):
-                    x, shared_kv = layer(x, cos_sin, kv_cache, shared_kv=shared_kv)
-                shared_kv = None
-
+                    if j == 0:
+                        x, shared_kv = layer(x, cos_sin, kv_cache, shared_kv=None)
+                    else:
+                        x, _ = layer(x, cos_sin, kv_cache, shared_kv=shared_kv)
+            
             elif self.config.share_kv and i % self.config.share_kv_n_layers == 0:
                 x, shared_kv = layer(x, cos_sin, kv_cache, shared_kv=shared_kv)
-
+            
             else:
                 x, _ = layer(x, cos_sin, kv_cache, shared_kv=shared_kv)
 
         x = norm(x)
 
-        # Forward the lm_head (compute logits)
-        #softcap = 15
 
         if targets is not None:
             # training mode: compute and return the loss

@@ -4,6 +4,7 @@
 #SBATCH --error=../logs/%x_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
+#SBATCH --nodelist=ws-l4-019
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:nvidia-rtx-5000-ada-generation:1
 #SBATCH --mem=50G
@@ -28,9 +29,11 @@ set +a
 
 #python train.py --config configs/naive.yaml
 
+python train.py --config configs/recursive.yaml
+
 python train.py --config configs/babylm_recursive.yaml
 
-python train.py --config configs/recursive.yaml
+
 
 python train.py --config configs/babylm_act.yaml
 
