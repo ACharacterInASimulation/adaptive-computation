@@ -9,6 +9,8 @@ import torch.nn.functional as F
 
 
 from models.act_block import AdaptiveBlock
+from models.ponder_block import AdaptivePonderBlock
+
 
 
 @dataclass
@@ -34,6 +36,13 @@ class TransformerBlockConfig:
     max_pondering_steps: int = 5
     act_threshold: float = 0.99
     halting_penalty: float = 0.01  # tau in ACT paper
+
+    # --- PonderNet (probabilistic halting) ---
+    use_pondernet: bool = False      # turn on to use PonderNet instead of ACT
+    geom_lambda_prior: float = 0.5   # λ for geometric prior (E[T]=1/λ)
+    kl_weight_beta: float = 0.05     # β weight on KL(p||q)
+    cdf_early_stop: float = 0.999    # optional early stop when CDF≈1
+
 
 
 class KVCache:
@@ -279,6 +288,17 @@ class GPT(nn.Module):
                 "wte": nn.Embedding(config.vocab_size, config.n_embd),
                 "h": nn.ModuleList(blocks),
             })
+        elif config.use_pondernet:
+            assert config.n_layer % config.n_layers_per_block == 0
+            n_blocks = config.n_layer // config.n_layers_per_block
+            blocks = []
+            for block_idx in range(n_blocks):
+                start_layer_idx = block_idx * config.n_layers_per_block
+                blocks.append(AdaptivePonderBlock(config, start_layer_idx, config.n_layers_per_block))
+            self.transformer = nn.ModuleDict({
+                "wte": nn.Embedding(config.vocab_size, config.n_embd),
+                "h": nn.ModuleList(blocks),
+            })
         else:
             # standard transformer
             if config.share_kv:
@@ -379,6 +399,14 @@ class GPT(nn.Module):
                 # Add layer params (excluding halting)
                 for layer in block.layers:
                     matrix_params.extend(layer.parameters())
+            elif isinstance(block, AdaptivePonderBlock):
+                halting_params.extend(block.halting_unit.parameters())
+                for layer in block.layers:
+                    matrix_params.extend(layer.parameters())
+            elif isinstance(block, AdaptivePonderBlock):
+                halting_params.extend(block.halting_unit.parameters())
+                for layer in block.layers:
+                    matrix_params.extend(layer.parameters())
 
 
                 matrix_params.extend(block.parameters())
@@ -423,6 +451,8 @@ class GPT(nn.Module):
 
         if self.config.use_adaptive_computation:
             return self.forward_adaptive(idx, targets, cos_sin,  kv_cache, loss_reduction, ponder_mask)
+        elif self.config.use_pondernet:
+            return self.forward_pondernet(idx, targets, cos_sin, kv_cache, loss_reduction, ponder_mask)
 
         # Standard forward pass (no adaptive computation)
         # Forward the trunk of the Transformer
@@ -505,6 +535,44 @@ class GPT(nn.Module):
 
         self.last_act_penalty = act_penalty.item()
         return task_loss, act_penalty
+    
+    def forward_ponder(self, idx, targets, cos_sin, kv_cache, loss_reduction='mean', ponder_mask=None):
+        B, T = idx.size()
+        x = self.transformer.wte(idx)
+        x = norm(x)
+
+        total_kl = torch.zeros((), device=idx.device)
+        total_expected = torch.zeros((), device=idx.device)
+
+        for block in self.transformer.h:  # these are AdaptivePonderBlock
+            x, kl_term, exp_steps = block(x, cos_sin, kv_cache, ponder_mask=ponder_mask)
+            total_kl = total_kl + kl_term
+            total_expected = total_expected + exp_steps.mean()
+
+        x = norm(x)
+        logits = self.lm_head(x).float()
+
+        # no ACT penalty here; use KL instead
+        if targets is None:
+            # stash metrics for generate()
+            self.last_expected_steps = (total_expected.item() / self.config.n_layer)
+            self.last_ponder_kl = total_kl.item()
+            return logits
+
+        ce = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
+            ignore_index=-1,
+            reduction=loss_reduction
+        )
+
+        loss = ce + self.config.kl_weight_beta * total_kl
+
+        # metrics (normalize per-layer for parity with ACT scalar you expose)
+        self.last_expected_steps = (total_expected.item() / self.config.n_layer)
+        self.last_ponder_kl = total_kl.item()
+        return loss, None  # or return aux dict
+
 
 
     @torch.inference_mode()
