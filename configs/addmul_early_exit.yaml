@@ -1,0 +1,52 @@
+model:
+  sequence_len: 128
+  n_head: 4
+  n_kv_head: 4
+  n_embd: 128
+  n_layer: 20
+  
+  # Early exit parameters
+  n_layers_per_block: 2  # Number of layers per block (each block has exit heads)
+  use_early_exit: true
+  exit_threshold: 0.8  # Confidence threshold for early exit (0.0-1.0)
+  exit_penalty: 0.01  # Penalty for encouraging earlier exits
+
+data:
+  dataset_name: "AddMul"  
+  num_samples: 100_000_000
+  max_operands: 5
+  max_digits: 5
+  operations: ["+", "*"]
+  seed: 0
+  eval_seed: 40
+
+optimizer:
+  unembedding_lr: 0.004
+  embedding_lr: 0.004
+  matrix_lr: 0.004
+  exit_lr: 0.004  # Learning rate for exit heads
+  weight_decay: 0.0
+
+training:
+  batch_size: 256
+  num_workers: 0
+  steps: 250000
+  log_every: 100
+  eval_every: 5000
+  eval_n_samples: 500
+  warmup_steps: 2000
+  gradient_clip: 1.0
+  seed: 42
+
+wandb:
+  enabled: true
+  project: "DL-project"
+  entity: null  
+  name: null  
+  tags: ["early_exit", "synthetic_task", "language-modeling"]
+  notes: "DL-project exp Early Exit"
+
+checkpoint:
+  save_dir: "checkpoints/AddMul"
+  save_final: true
+  final_name: "final_model_earlyexit.pt"
