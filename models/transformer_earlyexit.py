@@ -94,9 +94,16 @@ class KVCache:
         return key_view, value_view
 
 
+# def norm(x):
+#     # Purely functional rmsnorm with no learnable params
+#     return F.rms_norm(x, (x.size(-1),))
+
 def norm(x):
     # Purely functional rmsnorm with no learnable params
-    return F.rms_norm(x, (x.size(-1),))
+    # Manual implementation for PyTorch < 2.1
+    variance = x.pow(2).mean(-1, keepdim=True)
+    x = x * torch.rsqrt(variance + 1e-5)
+    return x
 
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4  # multihead attention
