@@ -1,0 +1,50 @@
+model:
+  sequence_len: 512
+  n_head: 8
+  n_kv_head: 8
+  n_embd: 512
+  n_layer: 30
+  
+  # Early exit parameters
+  n_layers_per_block: 2  # Number of layers per block (each block has exit heads)
+  use_early_exit: true
+  exit_threshold: 0.8  # Confidence threshold for early exit (0.0-1.0)
+  exit_penalty: 0.01  # Penalty for encouraging earlier exits
+
+data:
+  dataset_name: "BabyLM"  
+  data_dir: "./data/babylm/train_100M/"
+  val_data_dir: "./data/babylm/dev/"
+  tokenizer_path: "checkpoints"
+  shuffle: true
+
+optimizer:
+  unembedding_lr: 0.001
+  embedding_lr: 0.001
+  matrix_lr: 0.001
+  exit_lr: 0.001  # Learning rate for exit heads
+  weight_decay: 0.0
+
+training:
+  batch_size: 16
+  num_workers: 4
+  steps: 50000
+  log_every: 20
+  eval_every: 100
+  eval_n_samples: 64
+  warmup_steps: 50
+  gradient_clip: 1.0
+  seed: 42
+
+wandb:
+  enabled: true
+  project: "DL-project"
+  entity: null  
+  name: null  
+  tags: ["early_exit", "babylm", "language-modeling"]
+  notes: "DL-project exp Early Exit on BabyLM"
+
+checkpoint:
+  save_dir: "checkpoints/babylm"
+  save_final: true
+  final_name: "babylm_earlyexit.pt"
