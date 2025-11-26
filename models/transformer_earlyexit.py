@@ -94,16 +94,16 @@ class KVCache:
         return key_view, value_view
 
 
-# def norm(x):
-#     # Purely functional rmsnorm with no learnable params
-#     return F.rms_norm(x, (x.size(-1),))
-
 def norm(x):
     # Purely functional rmsnorm with no learnable params
-    # Manual implementation for PyTorch < 2.1
-    variance = x.pow(2).mean(-1, keepdim=True)
-    x = x * torch.rsqrt(variance + 1e-5)
-    return x
+    return F.rms_norm(x, (x.size(-1),))
+
+# def norm(x):
+#     # Purely functional rmsnorm with no learnable params
+#     # Manual implementation for PyTorch < 2.1
+#     variance = x.pow(2).mean(-1, keepdim=True)
+#     x = x * torch.rsqrt(variance + 1e-5)
+#     return x
 
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4  # multihead attention
@@ -492,8 +492,8 @@ class GPT(nn.Module):
 
         for block_idx, block in enumerate(self.transformer.h):
             x, layer_exit_info = block(x, cos_sin, kv_cache, 
-                                      use_early_exit=use_early_exit_training and targets is not None,
-                                      ponder_mask=ponder_mask)
+                                    use_early_exit=use_early_exit_training and targets is not None,
+                                    ponder_mask=ponder_mask)
 
             # Store exit info with block context
             for layer_idx_in_block, exit_logits, exited_mask in layer_exit_info:
@@ -501,6 +501,40 @@ class GPT(nn.Module):
                 all_exit_info.append((block_idx, layer_idx_in_block, global_layer_idx, exit_logits, exited_mask))
 
         x = norm(x)
+
+        # === NEW: Track expected steps (layers used) ===
+        # Initialize expected steps - all tokens start with full layers
+        expected_steps = torch.full((B, T), float(self.config.n_layer), device=idx.device)
+        
+        # Update based on early exits
+        for block_idx, layer_in_block, global_layer, exit_logits, exited_mask in all_exit_info:
+            if exited_mask is not None and exited_mask.any():
+                # Tokens that exited at this layer used (global_layer + 1) layers
+                # +1 because layers are 0-indexed but we count from 1
+                expected_steps = torch.where(
+                    exited_mask & (expected_steps == self.config.n_layer),
+                    torch.full_like(expected_steps, float(global_layer + 1)),
+                    expected_steps
+                )
+        
+        # Compute mean expected steps
+        if ponder_mask is not None:
+            # Only count tokens that can ponder
+            mask = ponder_mask.squeeze(-1).bool() & (targets != -1) if targets is not None else ponder_mask.squeeze(-1).bool()
+            if mask.any():
+                self.last_expected_steps = (expected_steps * mask.float()).sum().item() / mask.sum().item()
+            else:
+                self.last_expected_steps = self.config.n_layer
+        else:
+            # Count all valid tokens
+            if targets is not None:
+                mask = (targets != -1)
+                if mask.any():
+                    self.last_expected_steps = (expected_steps * mask.float()).sum().item() / mask.sum().item()
+                else:
+                    self.last_expected_steps = self.config.n_layer
+            else:
+                self.last_expected_steps = expected_steps.mean().item()
 
         # Forward the lm_head (compute logits)
         logits = self.lm_head(x)
@@ -596,7 +630,7 @@ class GPT(nn.Module):
         else:
             # Inference mode: compute and return the logits
             return logits
-
+        
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, ponder_mask=None, temperature=1.0, top_k=None, seed=42, use_early_exit=None):
         """
