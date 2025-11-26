@@ -236,6 +236,7 @@ class TransformerBlock(nn.Module):
     """
     Block containing N transformer layers with optional early exit capability.
     Each layer can have an exit head for per-layer early exit within the block.
+    Early exit is controlled by ponder_mask - only tokens with ponder_mask=1 can exit early.
     """
     def __init__(self, config, start_layer_idx, n_layers_per_block, is_last_block=False):
         super().__init__()
@@ -262,15 +263,17 @@ class TransformerBlock(nn.Module):
         else:
             self.exit_heads = [None] * n_layers_per_block
 
-    def forward(self, x, cos_sin, kv_cache=None, use_early_exit=False):
+    def forward(self, x, cos_sin, kv_cache=None, use_early_exit=False, ponder_mask=None):
         """
         Forward pass through layers in this block with optional per-layer early exit.
+        Early exit only applies to tokens where ponder_mask=1.
 
         Args:
             x: input (B, T, C)
             cos_sin: rotary embeddings
             kv_cache: KV cache for inference
             use_early_exit: whether to check for early exit at each layer
+            ponder_mask: (B, T) or (B, T, 1) mask indicating which tokens can use early exit
 
         Returns:
             x: output after processing
@@ -278,6 +281,14 @@ class TransformerBlock(nn.Module):
         """
         B, T, C = x.size()
         layer_exit_info = []
+
+        # Process ponder_mask
+        if ponder_mask is not None:
+            if ponder_mask.dim() == 2:
+                ponder_mask = ponder_mask.unsqueeze(-1)  # (B, T) -> (B, T, 1)
+            can_exit = ponder_mask.squeeze(-1).bool()  # (B, T)
+        else:
+            can_exit = torch.ones(B, T, dtype=torch.bool, device=x.device)
 
         # Track which tokens have exited within this block
         exited_in_block = torch.zeros(B, T, dtype=torch.bool, device=x.device)
@@ -301,7 +312,11 @@ class TransformerBlock(nn.Module):
                     with torch.no_grad():
                         probs = F.softmax(exit_logits.float(), dim=-1)
                         max_probs = probs.max(dim=-1)[0]  # (B, T)
-                        should_exit = (max_probs >= self.config.exit_threshold) & (~exited_in_block)
+                        # Only allow exit for tokens that:
+                        # 1. Can ponder (ponder_mask=1)
+                        # 2. Haven't exited yet
+                        # 3. Meet confidence threshold
+                        should_exit = (max_probs >= self.config.exit_threshold) & can_exit & (~exited_in_block)
 
                         if should_exit.any():
                             exited_in_block = exited_in_block | should_exit
@@ -417,9 +432,9 @@ class GPT(nn.Module):
                     if exit_head is not None:
                         exit_params.extend(exit_head.parameters())
 
-        # Scale the LR for the AdamW parameters by ∝1/√dmodel
+        # Scale the LR for the AdamW parameters by √1/√dmodel
         dmodel_lr_scale = (model_dim / 768) ** -0.5
-        print(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
+        print(f"Scaling the LR for the AdamW parameters √1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
 
         param_groups = [
             dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
@@ -442,11 +457,16 @@ class GPT(nn.Module):
 
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', return_exit_info=False, use_early_exit_training=None):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', return_exit_info=False, 
+                use_early_exit_training=None, ponder_mask=None):
         B, T = idx.size()
 
         if use_early_exit_training is None:
             use_early_exit_training = self.config.use_early_exit
+
+        # Process ponder_mask
+        if ponder_mask is not None and ponder_mask.dim() == 2:
+            ponder_mask = ponder_mask.unsqueeze(-1)  # (B, T) -> (B, T, 1)
 
         # Grab the rotary embeddings for the current sequence length
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
@@ -464,7 +484,9 @@ class GPT(nn.Module):
         all_exit_info = []
 
         for block_idx, block in enumerate(self.transformer.h):
-            x, layer_exit_info = block(x, cos_sin, kv_cache, use_early_exit=use_early_exit_training and targets is not None)
+            x, layer_exit_info = block(x, cos_sin, kv_cache, 
+                                      use_early_exit=use_early_exit_training and targets is not None,
+                                      ponder_mask=ponder_mask)
 
             # Store exit info with block context
             for layer_idx_in_block, exit_logits, exited_mask in layer_exit_info:
@@ -495,12 +517,12 @@ class GPT(nn.Module):
             # Compute main task loss
             task_loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
-                targets.view(-1),
+                targets.reshape(-1),
                 ignore_index=-1,
                 reduction=loss_reduction
             )
 
-            # Compute auxiliary exit losses
+            # Compute auxiliary exit losses (only for tokens that can ponder)
             exit_loss = 0.0
             exit_penalty = 0.0
 
@@ -508,25 +530,33 @@ class GPT(nn.Module):
                 total_exit_loss = 0.0
                 num_exit_heads = 0
 
+                # Create mask for ponderable tokens
+                if ponder_mask is not None:
+                    can_ponder = ponder_mask.squeeze(-1).bool()  # (B, T)
+                else:
+                    can_ponder = torch.ones(B, T, dtype=torch.bool, device=idx.device)
+
                 for block_idx, layer_in_block, global_layer, exit_logits, exited_mask in all_exit_info:
                     if exit_logits is not None:
-                        # Compute loss for this exit head
+                        # Compute loss for this exit head (only on ponderable tokens)
                         exit_logits_float = exit_logits.float()
                         head_loss = F.cross_entropy(
                             exit_logits_float.view(-1, exit_logits_float.size(-1)),
-                            targets.view(-1),
+                            targets.reshape(-1),
                             ignore_index=-1,
                             reduction=loss_reduction
                         )
                         total_exit_loss += head_loss
                         num_exit_heads += 1
 
-                        # Add penalty based on layer depth (encourage earlier exits)
+                        # Add penalty based on layer depth (only for ponderable tokens that exited)
                         if exited_mask is not None and exited_mask.any():
-                            mask = exited_mask & (targets != -1)
+                            mask = exited_mask & can_ponder & (targets != -1)
                             if mask.any():
-                                weight = mask.sum().float() / (targets != -1).sum().float()
-                                exit_penalty += (global_layer + 1) * weight * self.config.exit_penalty
+                                ponder_count = (can_ponder & (targets != -1)).sum().float()
+                                if ponder_count > 0:
+                                    weight = mask.sum().float() / ponder_count
+                                    exit_penalty += (global_layer + 1) * weight * self.config.exit_penalty
 
                 exit_loss = total_exit_loss / num_exit_heads if num_exit_heads > 0 else 0.0
 
@@ -537,8 +567,12 @@ class GPT(nn.Module):
             self.last_exit_penalty = exit_penalty if isinstance(exit_penalty, float) else exit_penalty.item()
 
             if return_exit_info:
-                # Compute exit distribution per layer for this batch
-                mask = targets != -1
+                # Compute exit distribution per layer for this batch (only for ponderable tokens)
+                if ponder_mask is not None:
+                    mask = (targets != -1) & ponder_mask.squeeze(-1).bool()
+                else:
+                    mask = targets != -1
+                    
                 if mask.any():
                     exit_distribution = []
                     # Count exits at each layer
@@ -557,11 +591,18 @@ class GPT(nn.Module):
             return logits
 
     @torch.inference_mode()
-    def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42, use_early_exit=None):
+    def generate(self, tokens, max_tokens, ponder_mask=None, temperature=1.0, top_k=None, seed=42, use_early_exit=None):
         """
         Generate tokens with optional early exit during inference.
+        Early exit only applies to tokens where ponder_mask=1.
 
         Args:
+            tokens: list of input token ids
+            max_tokens: maximum number of tokens to generate
+            ponder_mask: list indicating which positions can use early exit (1=can exit, 0=must use all layers)
+            temperature: sampling temperature
+            top_k: top-k sampling
+            seed: random seed
             use_early_exit: If True, exit early when confidence threshold is met.
                           If None, use config.use_early_exit
         """
@@ -574,6 +615,10 @@ class GPT(nn.Module):
         if use_early_exit is None:
             use_early_exit = self.config.use_early_exit
 
+        # Convert ponder_mask to tensor if provided
+        if ponder_mask is not None:
+            ponder_mask = torch.tensor([ponder_mask], dtype=torch.float32, device=device)
+
         head_dim = self.config.n_embd // self.config.n_head
         kv_cache = KVCache(
             batch_size=1,
@@ -584,15 +629,15 @@ class GPT(nn.Module):
         )
 
         # Prefill
-        _ = self.forward(ids, kv_cache=kv_cache)
+        _ = self.forward(ids, kv_cache=kv_cache, ponder_mask=ponder_mask)
 
         exit_counts = [0] * (self.config.n_layer + 1)  # Track which layer we exit at
 
         for _ in range(max_tokens):
             last = ids[:, -1:]
 
-            if use_early_exit:
-                # Manual forward pass with early exit logic
+            if use_early_exit and ponder_mask is not None and ponder_mask[:, -1].item() == 1:
+                # Manual forward pass with early exit logic for ponderable tokens
                 B, T = last.size()
                 T0 = kv_cache.get_pos()
                 cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
@@ -627,8 +672,8 @@ class GPT(nn.Module):
                     logits = self.lm_head(x)[:, -1, :]
                     exit_counts[-1] += 1
             else:
-                # Standard forward pass
-                logits = self.forward(last, kv_cache=kv_cache)
+                # Standard forward pass (no early exit for non-ponderable tokens)
+                logits = self.forward(last, kv_cache=kv_cache, ponder_mask=ponder_mask if ponder_mask is not None else None)
                 logits = logits[:, -1, :]
                 exit_counts[-1] += 1
 
@@ -642,7 +687,19 @@ class GPT(nn.Module):
             else:
                 next_id = torch.argmax(logits, dim=-1, keepdim=True)
             ids = torch.cat((ids, next_id), dim=1)
-            yield next_id.item()
+            
+            # Update ponder_mask for generated token (always allow pondering for generated tokens)
+            if ponder_mask is not None:
+                new_ponder = torch.ones(1, 1, dtype=torch.float32, device=device)
+                ponder_mask = torch.cat([ponder_mask, new_ponder], dim=1)
+            
+            # Yield token and average exit layer
+            if exit_counts[-1] > 0:
+                total_exits = sum(exit_counts)
+                avg_layer = sum(i * count for i, count in enumerate(exit_counts)) / total_exits if total_exits > 0 else self.config.n_layer
+                yield next_id.item(), avg_layer
+            else:
+                yield next_id.item(), float('nan')
 
         # Store exit distribution for analysis
         self.last_exit_distribution = exit_counts
