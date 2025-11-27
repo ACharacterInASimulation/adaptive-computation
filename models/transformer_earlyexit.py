@@ -637,29 +637,24 @@ class GPT(nn.Module):
         Generate tokens with optional early exit during inference.
         Early exit only applies to tokens where ponder_mask=1.
 
-        Args:
-            tokens: list of input token ids
-            max_tokens: maximum number of tokens to generate
-            ponder_mask: list indicating which positions can use early exit (1=can exit, 0=must use all layers)
-            temperature: sampling temperature
-            top_k: top-k sampling
-            seed: random seed
-            use_early_exit: If True, exit early when confidence threshold is met.
-                          If None, use config.use_early_exit
+        This implementation:
+        - uses exit heads only as *gates* (never for sampling),
+        - continues to later blocks after an early exit inside a block,
+        - always finishes the model with lm_head so KVCache.pos advances correctly.
         """
         assert isinstance(tokens, list)
         device = self.get_device()
-        if temperature > 0:
-            rng = torch.Generator(device=device).manual_seed(seed)
+        rng = torch.Generator(device=device).manual_seed(seed) if temperature > 0 else None
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
 
         if use_early_exit is None:
             use_early_exit = self.config.use_early_exit
 
-        # Convert ponder_mask to tensor if provided
+        # Optional ponder mask
         if ponder_mask is not None:
             ponder_mask = torch.tensor([ponder_mask], dtype=torch.float32, device=device)
 
+        # Build KV cache
         head_dim = self.config.n_embd // self.config.n_head
         kv_cache = KVCache(
             batch_size=1,
@@ -669,56 +664,56 @@ class GPT(nn.Module):
             num_layers=self.config.n_layer,
         )
 
-        # Prefill
+        # Prefill the cache with the prompt (no early exit in this pass)
         _ = self.forward(ids, kv_cache=kv_cache, ponder_mask=ponder_mask)
 
-        exit_counts = [0] * (self.config.n_layer + 1)  # Track which layer we exit at
+        # Track distribution of exit layers; last bucket is "no early exit"
+        exit_counts = [0] * (self.config.n_layer + 1)
 
         for _ in range(max_tokens):
             last = ids[:, -1:]
 
-            if use_early_exit and ponder_mask is not None and ponder_mask[:, -1].item() == 1:
-                # Manual forward pass with early exit logic for ponderable tokens
-                B, T = last.size()
-                T0 = kv_cache.get_pos()
-                cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+            # Rotary slice for the next position in cache
+            T0 = kv_cache.get_pos()
+            cos_sin = (self.cos[:, T0:T0+1], self.sin[:, T0:T0+1])
 
-                x = self.transformer.wte(last)
-                x = norm(x)
+            # Embed + pre-norm
+            x = norm(self.transformer.wte(last))
 
-                exited = False
-                exit_layer_idx = None
+            # Allow gating only if enabled *and* the last position is ponderable
+            allow_gate = use_early_exit and (ponder_mask is None or ponder_mask[:, -1].item() == 1)
 
+            earliest_exit = None  # global layer index if a gate fires for this token
+
+            if allow_gate:
+                # Gate just the last token (B=1, T=1 here)
+                token_mask = (ponder_mask[:, -1:] if ponder_mask is not None
+                            else torch.ones_like(last, dtype=torch.float32, device=device))
+
+                # Run blocks; a gate can stop the *rest of the current block*,
+                # but we still proceed to the next blocks so KV remains consistent.
                 for block_idx, block in enumerate(self.transformer.h):
-                    for layer_idx, (layer, exit_head) in enumerate(zip(block.layers, block.exit_heads)):
-                        x = layer(x, cos_sin, kv_cache)
-
-                        if exit_head is not None and not exited:
-                            exit_logits = exit_head(norm(x))
-                            exit_probs = F.softmax(exit_logits.float() / temperature, dim=-1)
-                            max_prob = exit_probs.max().item()
-
-                            if max_prob >= self.config.exit_threshold:
-                                logits = exit_logits[:, -1, :]
-                                exited = True
-                                exit_layer_idx = block_idx * self.config.n_layers_per_block + layer_idx
-                                exit_counts[exit_layer_idx] += 1
+                    x, layer_exit_info = block(
+                        x, cos_sin, kv_cache,
+                        use_early_exit=True,
+                        ponder_mask=token_mask
+                    )
+                    # Record the first layer that triggered exit (if any)
+                    if earliest_exit is None:
+                        for layer_in_block, _, exited_mask in layer_exit_info:
+                            if exited_mask is not None and exited_mask[0, 0].item():
+                                earliest_exit = block_idx * self.config.n_layers_per_block + layer_in_block
                                 break
-
-                    if exited:
-                        break
-
-                if not exited:
-                    x = norm(x)
-                    logits = self.lm_head(x)[:, -1, :]
-                    exit_counts[-1] += 1
             else:
-                # Standard forward pass (no early exit for non-ponderable tokens)
-                logits = self.forward(last, kv_cache=kv_cache, ponder_mask=ponder_mask if ponder_mask is not None else None)
-                logits = logits[:, -1, :]
-                exit_counts[-1] += 1
+                # No gating for this token: run full stack
+                for block in self.transformer.h:
+                    x, _ = block(x, cos_sin, kv_cache, use_early_exit=False, ponder_mask=None)
 
-            # Sample next token
+            # Final norm + logits from the main head (never from exit heads)
+            x = norm(x)
+            logits = self.lm_head(x)[:, -1, :]
+
+            # Top-k + temperature sampling
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('inf')
@@ -727,20 +722,27 @@ class GPT(nn.Module):
                 next_id = torch.multinomial(probs, num_samples=1, generator=rng)
             else:
                 next_id = torch.argmax(logits, dim=-1, keepdim=True)
-            ids = torch.cat((ids, next_id), dim=1)
-            
-            # Update ponder_mask for generated token (always allow pondering for generated tokens)
-            if ponder_mask is not None:
-                new_ponder = torch.ones(1, 1, dtype=torch.float32, device=device)
-                ponder_mask = torch.cat([ponder_mask, new_ponder], dim=1)
-            
-            # Yield token and average exit layer
-            if exit_counts[-1] > 0:
-                total_exits = sum(exit_counts)
-                avg_layer = sum(i * count for i, count in enumerate(exit_counts)) / total_exits if total_exits > 0 else self.config.n_layer
-                yield next_id.item(), avg_layer
-            else:
-                yield next_id.item(), float('nan')
 
-        # Store exit distribution for analysis
+            ids = torch.cat((ids, next_id), dim=1)
+
+            # Extend ponder mask: generated tokens are ponderable by default
+            if ponder_mask is not None:
+                ponder_mask = torch.cat(
+                    [ponder_mask, torch.ones(1, 1, dtype=torch.float32, device=device)],
+                    dim=1
+                )
+
+            # Update exit stats
+            if earliest_exit is None:
+                exit_counts[-1] += 1  # "no early exit"
+            else:
+                exit_counts[earliest_exit] += 1
+
+            total = sum(exit_counts)
+            avg_layer = (sum(i * c for i, c in enumerate(exit_counts)) / total) if total > 0 else float(self.config.n_layer)
+
+            # Yield (token, running average exit layer)
+            yield next_id.item(), avg_layer
+
+        # Expose distribution for external analysis
         self.last_exit_distribution = exit_counts
