@@ -2,7 +2,7 @@ model:
   sequence_len: 512
   n_head: 8
   n_kv_head: 8
-  n_embd: 256
+  n_embd: 512
   n_layer: 6
   
   # Recursive configuration

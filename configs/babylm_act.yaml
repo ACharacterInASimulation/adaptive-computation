@@ -7,7 +7,7 @@ model:
   use_adaptive_computation: true
   n_layers_per_block: 1
   max_pondering_steps: 5
-  act_threshold: 0.99
+  act_threshold: 0.999
   halting_penalty: 0.0001
 
 
@@ -20,10 +20,10 @@ data:
 
 
 optimizer:
-  unembedding_lr: 0.001
-  embedding_lr: 0.001
-  matrix_lr: 0.001
-  halting_lr: 0.04
+  unembedding_lr: 0.004
+  embedding_lr: 0.004
+  matrix_lr: 0.004
+  halting_lr: 0.06
   weight_decay: 0.0
 
 
@@ -34,7 +34,7 @@ training:
   log_every: 10
   eval_every: 10
   eval_n_samples: 16
-  warmup_steps: 50
+  warmup_steps: 2000
   gradient_clip: 1.0
   seed: 42
 

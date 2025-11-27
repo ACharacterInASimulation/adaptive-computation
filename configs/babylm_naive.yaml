@@ -20,10 +20,10 @@ data:
 
 
 optimizer:
-  unembedding_lr: 0.005
-  embedding_lr: 0.005
-  matrix_lr: 0.005
-  halting_lr: 0.05
+  unembedding_lr: 0.001
+  embedding_lr: 0.001
+  matrix_lr: 0.001
+  halting_lr: 0.01
   weight_decay: 0.0
 
 
