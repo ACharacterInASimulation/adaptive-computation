@@ -29,17 +29,28 @@ set +a
 
 #python train.py --config configs/naive.yaml
 
-python train.py --config configs/recursive.yaml
+#python train.py --config configs/recursive.yaml
+
+#python train.py --config configs/babylm_recursive.yaml
+
+
+
+#python train.py --config configs/babylm_act.yaml
+
+#python train.py --config configs/babylm_naive.yaml
+
+python train.py --config configs/babylm_naive.yaml
+#python train.py --config configs/ponder.yaml
 
 python train.py --config configs/babylm_recursive.yaml
 
 
 
-python train.py --config configs/babylm_act.yaml
+#PROJECT_ROOT='/home/badrinath.chandana/git/ACharacterInASimulation/NLP701-assignment'
+#cd "$PROJECT_ROOT"
 
-python train.py --config configs/babylm_naive.yaml
 
-python train.py --config configs/babylm_shared_kv_naive.yaml
+#python train_grpo.py
 
 
 #python train.py --config configs/act.yaml

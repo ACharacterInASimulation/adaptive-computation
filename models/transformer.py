@@ -334,6 +334,10 @@ class GPT(nn.Module):
                 for layer in block.layers:
                     nn.init.zeros_(layer.mlp.c_proj.weight)
                     nn.init.zeros_(layer.attn.c_proj.weight)
+            elif isinstance(block, AdaptivePonderBlock):
+                for layer in block.layers:
+                    nn.init.zeros_(layer.mlp.c_proj.weight)
+                    nn.init.zeros_(layer.attn.c_proj.weight)
             else:
                 torch.nn.init.zeros_(block.mlp.c_proj.weight)
                 torch.nn.init.zeros_(block.attn.c_proj.weight)
@@ -403,12 +407,8 @@ class GPT(nn.Module):
                 halting_params.extend(block.halting_unit.parameters())
                 for layer in block.layers:
                     matrix_params.extend(layer.parameters())
-            elif isinstance(block, AdaptivePonderBlock):
-                halting_params.extend(block.halting_unit.parameters())
-                for layer in block.layers:
-                    matrix_params.extend(layer.parameters())
-
-
+            else:
+                # Standard Block
                 matrix_params.extend(block.parameters())
         
         # Create a simple AdamW optimizer for all parameters
@@ -452,7 +452,7 @@ class GPT(nn.Module):
         if self.config.use_adaptive_computation:
             return self.forward_adaptive(idx, targets, cos_sin,  kv_cache, loss_reduction, ponder_mask)
         elif self.config.use_pondernet:
-            return self.forward_pondernet(idx, targets, cos_sin, kv_cache, loss_reduction, ponder_mask)
+            return self.forward_ponder(idx, targets, cos_sin, kv_cache, loss_reduction, ponder_mask)
 
         # Standard forward pass (no adaptive computation)
         # Forward the trunk of the Transformer

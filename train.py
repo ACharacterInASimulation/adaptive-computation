@@ -17,8 +17,6 @@ def load_config(config_path):
         config = yaml.safe_load(f)
     return config
 
-
-
 def merge_configs(base_config, override_config):
     merged = base_config.copy()
     for key, value in override_config.items():
@@ -72,6 +70,12 @@ def init_wandb(model_cfg, config):
             threshold = model_cfg.act_threshold
             penalty = model_cfg.halting_penalty
             name = f"{dataset}-d{n_embd}-l{n_layer}-h{n_head}-{kv_type}{kv_suffix}{recursive_suffix}-ACT{max_steps}x{n_blocks}-th{threshold}-pen{penalty}"
+        elif model_cfg.use_pondernet:
+            max_steps = model_cfg.max_pondering_steps
+            n_blocks = model_cfg.n_layers_per_block
+            geom_lambda = model_cfg.geom_lambda_prior
+            kl_beta = model_cfg.kl_weight_beta
+            name = f"{dataset}-d{n_embd}-l{n_layer}-h{n_head}-{kv_type}{kv_suffix}{recursive_suffix}-Ponder{max_steps}x{n_blocks}-λ{geom_lambda}-β{kl_beta}"
         else:
             name = f"{dataset}-d{n_embd}-l{n_layer}-h{n_head}-{kv_type}{kv_suffix}{recursive_suffix}-baseline"
 
@@ -192,11 +196,16 @@ def main(config_file="configs/babylm_act.yaml"):
         share_kv_n_layers=MODEL_CFG.get("share_kv_n_layers", 0),
         recursive=MODEL_CFG.get("recursive", False),
         recursion_depth=MODEL_CFG.get("recursion_depth", 5),
-        use_adaptive_computation=MODEL_CFG["use_adaptive_computation"],
+        use_adaptive_computation=MODEL_CFG.get("use_adaptive_computation", False),
         n_layers_per_block=MODEL_CFG["n_layers_per_block"],
         max_pondering_steps=MODEL_CFG["max_pondering_steps"],
-        act_threshold=MODEL_CFG["act_threshold"],
-        halting_penalty=MODEL_CFG["halting_penalty"],
+        act_threshold=MODEL_CFG.get("act_threshold", 0.99),
+        halting_penalty=MODEL_CFG.get("halting_penalty", 0.01),
+        # PonderNet config
+        use_pondernet=MODEL_CFG.get("use_pondernet", False),
+        geom_lambda_prior=MODEL_CFG.get("geom_lambda_prior", 0.5),
+        kl_weight_beta=MODEL_CFG.get("kl_weight_beta", 0.05),
+        cdf_early_stop=MODEL_CFG.get("cdf_early_stop", 0.999),
     )
 
     model = GPT(cfg).to(device)
@@ -257,6 +266,12 @@ def main(config_file="configs/babylm_act.yaml"):
                 penalty_scale = 1.0
 
             actual_loss = task_loss + penalty_scale * act_penalty
+        elif cfg.use_pondernet:
+            # PonderNet: loss already includes KL term from forward_pondernet
+            actual_loss, _ = model(idx, targets=targets, kv_cache=None,
+                        loss_reduction="mean", ponder_mask=ponder_mask)
+            task_loss = actual_loss  # For logging purposes
+            penalty_scale = cfg.kl_weight_beta  # Log the KL weight
         else:
             task_loss, _ = model(idx, targets=targets, kv_cache=None,
                         loss_reduction="mean", ponder_mask=ponder_mask)
@@ -284,6 +299,13 @@ def main(config_file="configs/babylm_act.yaml"):
                     log_dict.update({
                         "act/expected_steps": es,
                         "act/penalty_scale": penalty_scale,
+                    })
+                elif cfg.use_pondernet:
+                    ponder_kl = getattr(model, "last_ponder_kl", float("nan"))
+                    log_dict.update({
+                        "ponder/expected_steps": es,
+                        "ponder/kl_loss": ponder_kl,
+                        "ponder/kl_weight": cfg.kl_weight_beta,
                     })
                 wandb.log(log_dict, step=step)
         

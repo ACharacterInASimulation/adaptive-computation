@@ -1,3 +1,4 @@
+
 model:
   sequence_len: 128
   n_head: 4
@@ -5,22 +6,17 @@ model:
   n_embd: 128
   n_layer: 4
   
-  # Recursive configuration
-  recursive: true
-  recursion_depth: 2
-  
-
-  share_kv: false
-  share_kv_n_layers: 0
   use_adaptive_computation: false
+  use_pondernet: true
   n_layers_per_block: 1
   max_pondering_steps: 5
-  act_threshold: 0.99
-  halting_penalty: 0.001
+  geom_lambda_prior: 0.5
+  kl_weight_beta: 0.05
+  cdf_early_stop: 0.999
 
 
 data:
-  dataset_name: "AddMul"
+  dataset_name: "AddMul"  
   num_samples: 100_000_000
   max_operands: 5
   max_digits: 5
@@ -30,17 +26,17 @@ data:
 
 
 optimizer:
-  unembedding_lr: 0.001
-  embedding_lr: 0.001
-  matrix_lr: 0.001
-  halting_lr: 0.001
+  unembedding_lr: 0.004
+  embedding_lr: 0.004
+  matrix_lr: 0.004
+  halting_lr: 0.08
   weight_decay: 0.0
 
 
 training:
   batch_size: 256
   num_workers: 0
-  steps: 150000
+  steps: 250000
   log_every: 100
   eval_every: 5000
   eval_n_samples: 500
@@ -54,11 +50,11 @@ wandb:
   project: "DL-project"
   entity: null  
   name: null  
-  tags: ["act", "synthetic_task", "language-modeling"]
-  notes: "DL-project exp ACT"
+  tags: ["pondernet", "synthetic_task", "language-modeling"]
+  notes: "DL-project exp PonderNet"
 
 
 checkpoint:
-  save_dir: "checkpoints/recursive"
+  save_dir: "checkpoints/AddMul"
   save_final: true
-  final_name: "final_model_recursive.pt"
+  final_name: "final_model_ponder.pt"

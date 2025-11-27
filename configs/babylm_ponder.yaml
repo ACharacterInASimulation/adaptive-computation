@@ -3,12 +3,14 @@ model:
   n_head: 8
   n_kv_head: 8
   n_embd: 512
-  n_layer: 30
+  n_layer: 6
   use_adaptive_computation: false
+  use_pondernet: true
   n_layers_per_block: 1
   max_pondering_steps: 5
-  act_threshold: 0.99
-  halting_penalty: 0.0001
+  geom_lambda_prior: 0.5
+  kl_weight_beta: 0.05
+  cdf_early_stop: 0.999
 
 
 data:
@@ -20,10 +22,10 @@ data:
 
 
 optimizer:
-  unembedding_lr: 0.005
-  embedding_lr: 0.005
-  matrix_lr: 0.005
-  halting_lr: 0.05
+  unembedding_lr: 0.001
+  embedding_lr: 0.001
+  matrix_lr: 0.001
+  halting_lr: 0.04
   weight_decay: 0.0
 
 
@@ -34,7 +36,7 @@ training:
   log_every: 10
   eval_every: 10
   eval_n_samples: 16
-  warmup_steps: 100
+  warmup_steps: 50
   gradient_clip: 1.0
   seed: 42
 
@@ -44,11 +46,11 @@ wandb:
   project: "DL-babylm"
   entity: null  
   name: null  
-  tags: ["recursive", "babylm", "language-modeling", "act"]
-  notes: "DL -project (babylm dataset)"
+  tags: ["pondernet", "babylm", "language-modeling"]
+  notes: "DL-project (babylm dataset with PonderNet)"
 
 
 checkpoint:
   save_dir: "checkpoints/babylm"
   save_final: true
-  final_name: "babylm_naive.pt"
+  final_name: "babylm_ponder_model.pt"
