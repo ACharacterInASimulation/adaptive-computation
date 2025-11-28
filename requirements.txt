@@ -1,0 +1,9 @@
+datasets==4.3.0
+huggingface-hub==0.36.0
+tiktoken==0.11.0
+tokenizers==0.22.1
+torch==2.8.0+cu126
+torchvision==0.23.0+cu126
+tqdm==4.67.1
+transformers==4.57.1
+datasets==4.3.0
